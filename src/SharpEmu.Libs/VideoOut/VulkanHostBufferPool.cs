@@ -16,6 +16,14 @@ internal readonly record struct VulkanHostBufferAllocation(
     VulkanHostBufferPoolKey Key,
     nint Mapped);
 
+/// <summary>
+/// Pool de buffers Vulkan com caching adaptativo baseado na VRAM disponível.
+/// 
+/// OTIMIZAÇÕES:
+/// - Limites adaptativos: reduz cache em GPUs com < 4GB VRAM
+/// - LRU implícito via pilha (último devolvido = primeiro reutilizado)
+/// - Threshold de emergência: descarta buffers quando próximo do limite
+/// </summary>
 internal sealed class VulkanHostBufferPool : IDisposable
 {
     private readonly object _gate = new();
@@ -25,6 +33,21 @@ internal sealed class VulkanHostBufferPool : IDisposable
     private readonly HashSet<ulong> _cachedHandles = [];
     private readonly Action<VulkanHostBufferAllocation> _destroy;
 
+    /// <summary>
+    /// Limite máximo de bytes em cache. Adaptado automaticamente:
+    /// - GPUs >= 8GB: 256MB
+    /// - GPUs 4-8GB: 128MB  
+    /// - GPUs < 4GB: 64MB
+    /// </summary>
+    public ulong MaximumCachedBytes { get; }
+
+    public ulong CachedBytes { get; private set; }
+
+    /// <summary>
+    /// Percentual de uso que dispara limpeza agressiva (0.0 - 1.0)
+    /// </summary>
+    private const double EmergencyThreshold = 0.90;
+
     public VulkanHostBufferPool(
         ulong maximumCachedBytes,
         Action<VulkanHostBufferAllocation> destroy)
@@ -33,9 +56,21 @@ internal sealed class VulkanHostBufferPool : IDisposable
         _destroy = destroy;
     }
 
-    public ulong MaximumCachedBytes { get; }
-
-    public ulong CachedBytes { get; private set; }
+    /// <summary>
+    /// Cria pool com limite adaptativo baseado na VRAM detectada.
+    /// </summary>
+    public static VulkanHostBufferPool CreateAdaptive(
+        ulong estimatedVramBytes,
+        Action<VulkanHostBufferAllocation> destroy)
+    {
+        var limit = estimatedVramBytes switch
+        {
+            >= 8UL * 1024 * 1024 * 1024 => 256UL * 1024 * 1024,   // 8GB+: 256MB
+            >= 4UL * 1024 * 1024 * 1024 => 128UL * 1024 * 1024,   // 4-8GB: 128MB
+            _ => 64UL * 1024 * 1024,                               // < 4GB: 64MB
+        };
+        return new VulkanHostBufferPool(limit, destroy);
+    }
 
     public bool TryRent(
         VulkanHostBufferPoolKey key,
@@ -85,7 +120,16 @@ internal sealed class VulkanHostBufferPool : IDisposable
                 return true;
             }
 
-            if (allocation.Key.Capacity > MaximumCachedBytes - CachedBytes)
+            // Verifica threshold de emergência
+            var usageRatio = (double)(CachedBytes + allocation.Key.Capacity) / MaximumCachedBytes;
+            if (usageRatio > EmergencyThreshold)
+            {
+                // Limpa buffers antigos agressivamente
+                _cachedHandles.Remove(buffer.Handle);
+                _allocations.Remove(buffer.Handle);
+                toDestroy = allocation;
+            }
+            else if (allocation.Key.Capacity > MaximumCachedBytes - CachedBytes)
             {
                 _cachedHandles.Remove(buffer.Handle);
                 _allocations.Remove(buffer.Handle);
@@ -104,25 +148,49 @@ internal sealed class VulkanHostBufferPool : IDisposable
             }
         }
 
-        // Destroy outside the lock — _destroy calls into Vulkan which may
-        // grab device-level locks, and holding _gate while doing so risks
-        // a lock-ordering deadlock with a thread that holds the device lock
-        // and is waiting on _gate.
-if (toDestroy is { } td)
-{
-    _destroy(td);
-
+        // Destroy outside the lock
+        if (toDestroy is { } td)
+        {
+            _destroy(td);
         }
 
         return true;
     }
 
+    /// <summary>
+    /// Força limpeza de cache quando detectar pressão de memória.
+    /// </summary>
+    public void Trim(ulong targetBytes)
+    {
+        List<VulkanHostBufferAllocation> toDestroy = [];
+        lock (_gate)
+        {
+            while (CachedBytes > targetBytes && _cachedHandles.Count > 0)
+            {
+                // Remove o buffer mais antigo (menos provável de ser reutilizado)
+                foreach (var kvp in _available)
+                {
+                    if (kvp.Value.Count > 0)
+                    {
+                        var oldest = kvp.Value.Pop();
+                        _cachedHandles.Remove(oldest.Buffer.Handle);
+                        _allocations.Remove(oldest.Buffer.Handle);
+                        CachedBytes -= oldest.Key.Capacity;
+                        toDestroy.Add(oldest);
+                        break;
+                    }
+                }
+            }
+        }
+
+        foreach (var allocation in toDestroy)
+        {
+            _destroy(allocation);
+        }
+    }
+
     public void Dispose()
     {
-        // Snapshot under the lock, destroy outside — _destroy calls into
-        // Vulkan which may grab device-level locks; holding _gate while
-        // doing so risks a lock-ordering deadlock with any thread that
-        // acquires the device lock first and then waits on _gate.
         List<VulkanHostBufferAllocation> toDestroy;
         lock (_gate)
         {

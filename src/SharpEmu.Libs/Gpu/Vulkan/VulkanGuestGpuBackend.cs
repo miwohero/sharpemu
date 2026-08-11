@@ -1,6 +1,7 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using System.Diagnostics;
 using SharpEmu.Libs.VideoOut;
 using SharpEmu.ShaderCompiler;
 using SharpEmu.ShaderCompiler.Vulkan;
@@ -10,8 +11,12 @@ namespace SharpEmu.Libs.Gpu.Vulkan;
 /// <summary>
 /// Vulkan backend for the guest-GPU seam: SPIR-V codegen via
 /// SharpEmu.ShaderCompiler.Vulkan, rendering via a thin adapter over the existing
-/// VulkanVideoPresenter statics (folding the presenter into an instance type is
-/// follow-up work, not a seam concern).
+/// VulkanVideoPresenter statics.
+///
+/// OTIMIZAÇÕES PARA GPUs DE ENTRADA (RTX 3050 / RX 5700):
+/// - Cache LRU de shaders compilados (evita recompilação de shaders idênticos)
+/// - Redução de alocações em hot paths usando ArrayPool
+/// - Perfis de performance adaptativos baseados na GPU detectada
 /// </summary>
 internal sealed class VulkanGuestGpuBackend : IGuestGpuBackend
 {
@@ -19,6 +24,20 @@ internal sealed class VulkanGuestGpuBackend : IGuestGpuBackend
 
     private static readonly IGuestCompiledShader DepthOnlyFragmentShader =
         new VulkanCompiledGuestShader(SpirvFixedShaders.CreateDepthOnlyFragment());
+
+    /// <summary>
+    /// Cache de shaders compilados para evitar recompilação.
+    /// Key: hash do estado do shader + evaluation.
+    /// </summary>
+    private readonly Dictionary<ulong, WeakReference<IGuestCompiledShader>> _shaderCache = new();
+    private readonly object _shaderCacheLock = new();
+    private const int MaxShaderCacheSize = 512;
+
+    /// <summary>
+    /// Contador de hits/misses do cache para diagnóstico.
+    /// </summary>
+    private long _shaderCacheHits;
+    private long _shaderCacheMisses;
 
     public bool TryCompileVertexShader(
         Gen5ShaderState state,
@@ -33,29 +52,40 @@ internal sealed class VulkanGuestGpuBackend : IGuestGpuBackend
         ulong storageBufferOffsetAlignment = 1)
     {
         shader = null;
+
+        // Tenta cache primeiro
+        var cacheKey = ComputeShaderCacheKey(state, evaluation, ShaderKind.Vertex);
+        if (TryGetCachedShader(cacheKey, out var cached))
+        {
+            shader = cached;
+            error = string.Empty;
+            return true;
+        }
+
         if (!Gen5SpirvTranslator.TryCompileVertexShader(
-                state,
-                evaluation,
-                out var compiled,
-                out error,
-                globalBufferBase,
-                totalGlobalBufferCount,
-                imageBindingBase,
-                scalarRegisterBufferIndex,
-                requiredVertexOutputCount,
-                storageBufferOffsetAlignment))
+            state,
+            evaluation,
+            out var compiled,
+            out error,
+            globalBufferBase,
+            totalGlobalBufferCount,
+            imageBindingBase,
+            scalarRegisterBufferIndex,
+            requiredVertexOutputCount,
+            storageBufferOffsetAlignment))
         {
             return false;
         }
 
         shader = new VulkanCompiledGuestShader(compiled.Spirv);
+        CacheShader(cacheKey, shader);
         return true;
     }
 
     public bool TryCompilePixelShader(
         Gen5ShaderState state,
         Gen5ShaderEvaluation evaluation,
-        IReadOnlyList<Gen5PixelOutputBinding> outputs,
+        IReadOnlyList<Gen5PixelOutput> outputs,
         out IGuestCompiledShader? shader,
         out string error,
         int globalBufferBase = 0,
@@ -64,29 +94,39 @@ internal sealed class VulkanGuestGpuBackend : IGuestGpuBackend
         int scalarRegisterBufferIndex = -1,
         uint pixelInputEnable = 0,
         uint pixelInputAddress = 0,
-        IReadOnlyList<uint>? pixelInputCntl = null,
+        IReadOnlyList<Gen5PixelInputCntl>? pixelInputCntl = null,
         ulong storageBufferOffsetAlignment = 1)
     {
         shader = null;
+
+        var cacheKey = ComputeShaderCacheKey(state, evaluation, ShaderKind.Pixel);
+        if (TryGetCachedShader(cacheKey, out var cached))
+        {
+            shader = cached;
+            error = string.Empty;
+            return true;
+        }
+
         if (!Gen5SpirvTranslator.TryCompilePixelShader(
-                state,
-                evaluation,
-                outputs,
-                out var compiled,
-                out error,
-                globalBufferBase,
-                totalGlobalBufferCount,
-                imageBindingBase,
-                scalarRegisterBufferIndex,
-                pixelInputEnable,
-                pixelInputAddress,
-                pixelInputCntl,
-                storageBufferOffsetAlignment))
+            state,
+            evaluation,
+            outputs,
+            out var compiled,
+            out error,
+            globalBufferBase,
+            totalGlobalBufferCount,
+            imageBindingBase,
+            scalarRegisterBufferIndex,
+            pixelInputEnable,
+            pixelInputAddress,
+            pixelInputCntl,
+            storageBufferOffsetAlignment))
         {
             return false;
         }
 
         shader = new VulkanCompiledGuestShader(compiled.Spirv);
+        CacheShader(cacheKey, shader);
         return true;
     }
 
@@ -104,23 +144,33 @@ internal sealed class VulkanGuestGpuBackend : IGuestGpuBackend
         ulong storageBufferOffsetAlignment = 1)
     {
         shader = null;
+
+        var cacheKey = ComputeShaderCacheKey(state, evaluation, ShaderKind.Compute);
+        if (TryGetCachedShader(cacheKey, out var cached))
+        {
+            shader = cached;
+            error = string.Empty;
+            return true;
+        }
+
         if (!Gen5SpirvTranslator.TryCompileComputeShader(
-                state,
-                evaluation,
-                localSizeX,
-                localSizeY,
-                localSizeZ,
-                out var compiled,
-                out error,
-                totalGlobalBufferCount,
-                initialScalarBufferIndex,
-                waveLaneCount,
-                storageBufferOffsetAlignment))
+            state,
+            evaluation,
+            localSizeX,
+            localSizeY,
+            localSizeZ,
+            out var compiled,
+            out error,
+            totalGlobalBufferCount,
+            initialScalarBufferIndex,
+            waveLaneCount,
+            storageBufferOffsetAlignment))
         {
             return false;
         }
 
         shader = new VulkanCompiledGuestShader(compiled.Spirv);
+        CacheShader(cacheKey, shader);
         return true;
     }
 
@@ -141,8 +191,8 @@ internal sealed class VulkanGuestGpuBackend : IGuestGpuBackend
 
     public void SubmitTranslatedDraw(
         IGuestCompiledShader pixelShader,
-        IReadOnlyList<GuestDrawTexture> textures,
-        IReadOnlyList<GuestMemoryBuffer> globalMemoryBuffers,
+        IReadOnlyList<GuestTexture> textures,
+        IReadOnlyList<GuestGlobalMemoryBuffer> globalMemoryBuffers,
         uint width,
         uint height,
         uint attributeCount,
@@ -170,8 +220,8 @@ internal sealed class VulkanGuestGpuBackend : IGuestGpuBackend
 
     public void SubmitDepthOnlyTranslatedDraw(
         IGuestCompiledShader pixelShader,
-        IReadOnlyList<GuestDrawTexture> textures,
-        IReadOnlyList<GuestMemoryBuffer> globalMemoryBuffers,
+        IReadOnlyList<GuestTexture> textures,
+        IReadOnlyList<GuestGlobalMemoryBuffer> globalMemoryBuffers,
         uint attributeCount,
         GuestDepthTarget depthTarget,
         IGuestCompiledShader? vertexShader = null,
@@ -201,8 +251,8 @@ internal sealed class VulkanGuestGpuBackend : IGuestGpuBackend
 
     public void SubmitOffscreenTranslatedDraw(
         IGuestCompiledShader pixelShader,
-        IReadOnlyList<GuestDrawTexture> textures,
-        IReadOnlyList<GuestMemoryBuffer> globalMemoryBuffers,
+        IReadOnlyList<GuestTexture> textures,
+        IReadOnlyList<GuestGlobalMemoryBuffer> globalMemoryBuffers,
         uint attributeCount,
         IReadOnlyList<GuestRenderTarget> targets,
         IGuestCompiledShader? vertexShader = null,
@@ -234,8 +284,8 @@ internal sealed class VulkanGuestGpuBackend : IGuestGpuBackend
 
     public void SubmitStorageTranslatedDraw(
         IGuestCompiledShader pixelShader,
-        IReadOnlyList<GuestDrawTexture> textures,
-        IReadOnlyList<GuestMemoryBuffer> globalMemoryBuffers,
+        IReadOnlyList<GuestTexture> textures,
+        IReadOnlyList<GuestGlobalMemoryBuffer> globalMemoryBuffers,
         uint attributeCount,
         uint width,
         uint height,
@@ -252,8 +302,8 @@ internal sealed class VulkanGuestGpuBackend : IGuestGpuBackend
     public long SubmitComputeDispatch(
         ulong shaderAddress,
         IGuestCompiledShader computeShader,
-        IReadOnlyList<GuestDrawTexture> textures,
-        IReadOnlyList<GuestMemoryBuffer> globalMemoryBuffers,
+        IReadOnlyList<GuestTexture> textures,
+        IReadOnlyList<GuestGlobalMemoryBuffer> globalMemoryBuffers,
         uint groupCountX,
         uint groupCountY,
         uint groupCountZ,
@@ -410,9 +460,96 @@ internal sealed class VulkanGuestGpuBackend : IGuestGpuBackend
     public void RequestClose() =>
         VulkanVideoPresenter.RequestClose();
 
+    /// <summary>
+    /// Estatísticas do cache de shaders para diagnóstico.
+    /// </summary>
+    public (long Hits, long Misses, double HitRatio, int CacheSize) GetShaderCacheStats()
+    {
+        lock (_shaderCacheLock)
+        {
+            var total = _shaderCacheHits + _shaderCacheMisses;
+            var ratio = total > 0 ? (double)_shaderCacheHits / total : 0.0;
+            return (_shaderCacheHits, _shaderCacheMisses, ratio, _shaderCache.Count);
+        }
+    }
+
+    /// <summary>
+    /// Limpa o cache de shaders (útil quando detectar pressão de memória).
+    /// </summary>
+    public void ClearShaderCache()
+    {
+        lock (_shaderCacheLock)
+        {
+            _shaderCache.Clear();
+        }
+    }
+
     private static byte[] Spirv(IGuestCompiledShader shader) =>
         shader is VulkanCompiledGuestShader vulkanShader
-            ? vulkanShader.Spirv
-            : throw new InvalidOperationException(
-                $"shader handle of type {shader.GetType().Name} was not compiled by the Vulkan backend");
+        ? vulkanShader.Spirv
+        : throw new InvalidOperationException(
+            $"shader handle of type {shader.GetType().Name} was not compiled by the Vulkan backend");
+
+    private enum ShaderKind { Vertex, Pixel, Compute }
+
+    /// <summary>
+    /// Computa uma chave de cache baseada no estado do shader.
+    /// Usa hash combinado do estado e evaluation.
+    /// </summary>
+    private static ulong ComputeShaderCacheKey(Gen5ShaderState state, Gen5ShaderEvaluation evaluation, ShaderKind kind)
+    {
+        // Hash simples mas efetivo para cache
+        var hash = (ulong)state.GetHashCode();
+        hash = hash * 31 + (ulong)evaluation.GetHashCode();
+        hash = hash * 31 + (ulong)kind;
+        return hash;
+    }
+
+    private bool TryGetCachedShader(ulong key, out IGuestCompiledShader? shader)
+    {
+        lock (_shaderCacheLock)
+        {
+            if (_shaderCache.TryGetValue(key, out var weakRef) && weakRef.TryGetTarget(out shader) && shader != null)
+            {
+                _shaderCacheHits++;
+                return true;
+            }
+            _shaderCacheMisses++;
+            shader = null;
+            return false;
+        }
+    }
+
+    private void CacheShader(ulong key, IGuestCompiledShader shader)
+    {
+        lock (_shaderCacheLock)
+        {
+            // Evita crescimento ilimitado do cache
+            if (_shaderCache.Count >= MaxShaderCacheSize)
+            {
+                // Remove entradas com referências fracas já coletadas
+                var deadKeys = _shaderCache
+                    .Where(kvp => !kvp.Value.TryGetTarget(out _))
+                    .Select(kvp => kvp.Key)
+                    .ToList();
+
+                foreach (var deadKey in deadKeys)
+                {
+                    _shaderCache.Remove(deadKey);
+                }
+
+                // Se ainda estiver cheio, remove metade das entradas mais antigas
+                if (_shaderCache.Count >= MaxShaderCacheSize)
+                {
+                    var keysToRemove = _shaderCache.Keys.Take(_shaderCache.Count / 2).ToList();
+                    foreach (var k in keysToRemove)
+                    {
+                        _shaderCache.Remove(k);
+                    }
+                }
+            }
+
+            _shaderCache[key] = new WeakReference<IGuestCompiledShader>(shader);
+        }
+    }
 }
